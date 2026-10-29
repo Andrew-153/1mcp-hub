@@ -79,6 +79,40 @@ export async function withPrivateInteractionConnection<T>(
   }
 }
 
+// POSIFLORA PATCH: calls to a legacy backend run on its shared connection, queued per backend, instead of
+// spawning a private backend process per call. ONE_MCP_INTERACTION_ISOLATION=private restores upstream behaviour.
+const sharedQueues = new WeakMap<OutboundConnection, Promise<void>>();
+
+async function runQueued<T>(
+  source: OutboundConnection,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  const previous = sharedQueues.get(source) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  sharedQueues.set(
+    source,
+    previous.then(() => mine),
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const lost = () => reject(new McpError(-32000, 'interaction_lost'));
+      if (signal?.aborted) return lost();
+      signal?.addEventListener('abort', lost, { once: true });
+      void previous.then(() => {
+        signal?.removeEventListener('abort', lost);
+        resolve();
+      });
+    });
+    return await run();
+  } finally {
+    release();
+  }
+}
+
 /** Reuse an empty legacy profile only with factory evidence; unknown or wider profiles require isolation. */
 async function withSelectedInteractionConnection<T>(
   source: OutboundConnection,
@@ -89,8 +123,13 @@ async function withSelectedInteractionConnection<T>(
   assertCurrent: () => void,
   issuedResourceRead?: CatalogEntry,
 ): Promise<T> {
-  if (!inbound.canonicalSchemaProjection || source.adapter.protocol?.era === 'modern') {
+  if (source.adapter.protocol?.era === 'modern') {
     return withRequestInteractionScope(source, inbound, extra, () => operation(source), undefined, assertCurrent);
+  }
+  if (!inbound.canonicalSchemaProjection || process.env.ONE_MCP_INTERACTION_ISOLATION !== 'private') {
+    return runQueued(source, extra.signal, () =>
+      withRequestInteractionScope(source, inbound, extra, () => operation(source), undefined, assertCurrent),
+    );
   }
   const callerCapabilities = getLegacyInboundServer(inbound).getClientCapabilities() ?? {};
   const interactive =
